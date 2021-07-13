@@ -7,7 +7,7 @@ require (
 	github.com/plgd-dev/kit v0.0.0-20200819113605-d5fcf3e94f63
 	github.com/stretchr/testify v1.7.0
 	go.uber.org/atomic v1.6.0
-	golang.org/x/net v0.0.0-20210502030024-e5908800b52b
+	golang.org/x/net v0.0.0-20210614182718-04defd469f4e
 )
 
 go 1.13
