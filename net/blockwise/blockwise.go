@@ -111,6 +111,8 @@ type Message interface {
 	SetCode(codes.Code)
 	SetToken(message.Token)
 	SetOptionUint32(id message.OptionID, value uint32)
+	SetOptionBytes(id message.OptionID, value []byte)
+
 	Remove(id message.OptionID)
 	ResetOptionsTo(message.Options)
 	SetBody(r io.ReadSeeker)
@@ -174,6 +176,13 @@ type BlockWise struct {
 	getSendedRequestFromOutside func(token message.Token) (Message, bool)
 
 	bwSendedRequest *kitSync.Map
+
+	dbglockedMessages *kitSync.Map
+}
+
+func (b *BlockWise) GetNumRunningResponses() int {
+	v := b.receivingMessagesCache.Items()
+	return len(v)
 }
 
 type messageGuard struct {
@@ -481,7 +490,7 @@ func (b *BlockWise) RemoveFromResponseCache(token message.Token) {
 
 func (b *BlockWise) sendEntityIncomplete(w ResponseWriter, token message.Token) {
 	sendMessage := b.acquireMessage(w.Message().Context())
-	sendMessage.SetCode(codes.RequestEntityIncomplete)
+	sendMessage.SetCode(codes.Empty)
 	sendMessage.SetToken(token)
 	w.SetMessage(sendMessage)
 }
@@ -718,10 +727,12 @@ func (b *BlockWise) processReceivedMessage(w ResponseWriter, r Message, maxSzx S
 		if szx > maxSzx {
 			szx = maxSzx
 		}
-		// first request must have 0
-		if num != 0 {
-			return fmt.Errorf("(%v) token %v, invalid %v(%v), expected 0", w.RemoteAddr(), []byte(token), blockType, num)
-		}
+		/*
+			// first request must have 0
+			if num != 0 {
+				return fmt.Errorf("(%v) token %v, invalid %v(%v), expected 0", w.RemoteAddr(), []byte(token), blockType, num)
+			}
+		*/
 		// if there is no more then just forward req to next handler
 		if !more {
 			next(w, r)
@@ -735,10 +746,17 @@ func (b *BlockWise) processReceivedMessage(w ResponseWriter, r Message, maxSzx S
 		msgGuard = newRequestGuard(cachedReceivedMessage)
 		msgGuard.Lock()
 		defer msgGuard.Unlock()
-		err := b.receivingMessagesCache.Add(tokenStr, msgGuard, expire)
+		err := b.receivingMessagesCache.Add(tokenStr, msgGuard, expire+time.Hour)
 		// request was already stored in cache, silently
 		if err != nil {
-			return fmt.Errorf("request was already stored in cache")
+			cachedReceivedMessageGuard, ok := b.receivingMessagesCache.Get(tokenStr)
+			if ok {
+				msgGuard = cachedReceivedMessageGuard.(*messageGuard)
+				msgGuard.Lock()
+				defer msgGuard.Unlock()
+			} else {
+				return fmt.Errorf("request was already stored in cache")
+			}
 		}
 	} else {
 		msgGuard = cachedReceivedMessageGuard.(*messageGuard)
@@ -751,6 +769,10 @@ func (b *BlockWise) processReceivedMessage(w ResponseWriter, r Message, maxSzx S
 		}
 	}(&err)
 	cachedReceivedMessage := msgGuard.request
+	payloadFile, ok := cachedReceivedMessage.Body().(*memfile.File)
+	if !ok {
+		return fmt.Errorf("invalid body type(%T) stored in receivingMessagesCache", cachedReceivedMessage.Body())
+	}
 	rETAG, errETAG := r.GetOptionBytes(message.ETag)
 	cachedReceivedMessageETAG, errCachedReceivedMessageETAG := cachedReceivedMessage.GetOptionBytes(message.ETag)
 	switch {
@@ -763,12 +785,10 @@ func (b *BlockWise) processReceivedMessage(w ResponseWriter, r Message, maxSzx S
 			return fmt.Errorf("received message contains ETAG(%v) but cached received message doesn't", rETAG)
 		}
 	case !bytes.Equal(rETAG, cachedReceivedMessageETAG):
-		return fmt.Errorf("(%v) received message ETAG(%v) is not equal to cached received message ETAG(%v)", w.RemoteAddr(), rETAG, cachedReceivedMessageETAG)
-	}
-
-	payloadFile, ok := cachedReceivedMessage.Body().(*memfile.File)
-	if !ok {
-		return fmt.Errorf("invalid body type(%T) stored in receivingMessagesCache", cachedReceivedMessage.Body())
+		//fmt.Printf("(%v) received message ETAG(%v) is not equal to cached received message ETAG(%v)\n", w.RemoteAddr(), rETAG, cachedReceivedMessageETAG)
+		cachedReceivedMessage.SetOptionBytes(message.ETag, rETAG)
+		payloadFile.Truncate(0)
+		//return fmt.Errorf("(%v) received message ETAG(%v) is not equal to cached received message ETAG(%v)", w.RemoteAddr(), rETAG, cachedReceivedMessageETAG)
 	}
 
 	off := num * szx.Size()
@@ -799,23 +819,23 @@ func (b *BlockWise) processReceivedMessage(w ResponseWriter, r Message, maxSzx S
 		if err != nil {
 			return fmt.Errorf("cannot truncate cached request: %w", err)
 		}
-	}
-	if !more {
-		b.receivingMessagesCache.Delete(tokenStr)
-		cachedReceivedMessage.Remove(blockType)
-		cachedReceivedMessage.Remove(sizeType)
-		cachedReceivedMessage.SetCode(r.Code())
-		setTypeFrom(cachedReceivedMessage, r)
-		if !bytes.Equal(cachedReceivedMessage.Token(), token) {
-			b.bwSendedRequest.Delete(tokenStr)
-		}
-		_, err := cachedReceivedMessage.Body().Seek(0, io.SeekStart)
-		if err != nil {
-			return fmt.Errorf("cannot seek to start of cachedReceivedMessage request: %w", err)
-		}
-		next(w, cachedReceivedMessage)
+		if !more {
+			b.receivingMessagesCache.Delete(tokenStr)
+			cachedReceivedMessage.Remove(blockType)
+			cachedReceivedMessage.Remove(sizeType)
+			cachedReceivedMessage.SetCode(r.Code())
+			setTypeFrom(cachedReceivedMessage, r)
+			if !bytes.Equal(cachedReceivedMessage.Token(), token) {
+				b.bwSendedRequest.Delete(tokenStr)
+			}
+			_, err := cachedReceivedMessage.Body().Seek(0, io.SeekStart)
+			if err != nil {
+				return fmt.Errorf("cannot seek to start of cachedReceivedMessage request: %w", err)
+			}
+			next(w, cachedReceivedMessage)
 
-		return nil
+			return nil
+		}
 	}
 	if szx > maxSzx {
 		szx = maxSzx

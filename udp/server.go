@@ -238,17 +238,20 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) closeSessions() {
+	var running int
 	s.connsMutex.Lock()
 	conns := s.conns
 	s.conns = make(map[string]*client.ClientConn)
 	s.connsMutex.Unlock()
 	for _, cc := range conns {
+		running += cc.GetNumRunningResponses()
 		cc.Close()
 		close := getClose(cc)
 		if close != nil {
 			close()
 		}
 	}
+	fmt.Printf("running blockwise %v\n", running)
 }
 
 func (s *Server) conn() *coapNet.UDPConn {

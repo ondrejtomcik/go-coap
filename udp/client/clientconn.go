@@ -145,6 +145,10 @@ func (cc *ClientConn) Close() error {
 	return cc.session.Close()
 }
 
+func (cc *ClientConn) GetNumRunningResponses() int {
+	return cc.blockWise.GetNumRunningResponses()
+}
+
 func (cc *ClientConn) do(req *pool.Message) (*pool.Message, error) {
 	token := req.Token()
 	if token == nil {
@@ -606,7 +610,6 @@ func (cc *ClientConn) Process(datagram []byte) error {
 		// instead send a Confirmable message.
 		origResp.SetType(req.Type())
 		w := NewResponseWriter(origResp, cc, req.Options())
-
 		if ok, err := cc.getResponseFromCache(req.MessageID(), w.response); ok {
 			defer pool.ReleaseMessage(w.response)
 			if !req.IsHijacked() {
@@ -624,7 +627,6 @@ func (cc *ClientConn) Process(datagram []byte) error {
 			cc.errors(fmt.Errorf("cannot unmarshal response from cache: %w", err))
 			return
 		}
-
 		reqType := req.Type()
 		origResp.SetModified(false)
 		cc.handle(w, req)
@@ -633,42 +635,55 @@ func (cc *ClientConn) Process(datagram []byte) error {
 		if !req.IsHijacked() {
 			pool.ReleaseMessage(req)
 		}
-		if w.response.IsModified() {
-			switch {
-			case w.response.Type() == udpMessage.Reset:
-				w.response.SetMessageID(reqMid)
-			case reqType == udpMessage.Confirmable:
-				w.response.SetType(udpMessage.Acknowledgement)
-				w.response.SetMessageID(reqMid)
-			default:
-				w.response.SetType(udpMessage.NonConfirmable)
-				w.response.SetMessageID(cc.getMID())
-			}
-			err := cc.session.WriteMessage(w.response)
-			if err != nil {
-				cc.Close()
-				cc.errors(fmt.Errorf("cannot write response: %w", err))
-				return
-			}
-		} else if reqType == udpMessage.Confirmable {
-			w.response.Reset()
-			w.response.SetCode(codes.Empty)
-			w.response.SetType(udpMessage.Acknowledgement)
-			w.response.SetMessageID(reqMid)
-			err := cc.session.WriteMessage(w.response)
+		if reqType == udpMessage.Confirmable {
+			separateMessage := pool.AcquireMessage(cc.Context())
+			separateMessage.SetCode(codes.Empty)
+			separateMessage.SetType(udpMessage.Acknowledgement)
+			separateMessage.SetMessageID(reqMid)
+			err := cc.session.WriteMessage(separateMessage)
 			if err != nil {
 				cc.Close()
 				cc.errors(fmt.Errorf("cannot write ack reponse: %w", err))
 				return
 			}
 		}
-
-		err = cc.addResponseToCache(w.response)
-		if err != nil {
-			cc.Close()
-			cc.errors(fmt.Errorf("cannot cache response: %w", err))
-			return
+		if w.response.IsModified() {
+			switch {
+			case w.response.Type() == udpMessage.Reset:
+				w.response.SetMessageID(reqMid)
+			default:
+				w.response.SetType(udpMessage.Confirmable)
+				w.response.SetMessageID(cc.getMID())
+			}
+			err := cc.writeMessage(w.response)
+			if err != nil {
+				cc.Close()
+				cc.errors(fmt.Errorf("cannot write response: %w", err))
+				return
+			}
 		}
+		/*
+			else if reqType == udpMessage.Confirmable {
+				w.response.Reset()
+				w.response.SetCode(codes.Empty)
+				w.response.SetType(udpMessage.Acknowledgement)
+				w.response.SetMessageID(reqMid)
+				err := cc.session.WriteMessage(w.response)
+				if err != nil {
+					cc.Close()
+					cc.errors(fmt.Errorf("cannot write ack reponse: %w", err))
+					return
+				}
+			}
+		*/
+		/*
+			err = cc.addResponseToCache(w.response)
+			if err != nil {
+				cc.Close()
+				cc.errors(fmt.Errorf("cannot cache response: %w", err))
+				return
+			}
+		*/
 	})
 	return nil
 }

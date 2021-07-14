@@ -24,12 +24,25 @@ type UDPConn struct {
 	onReadTimeout  func() error
 	onWriteTimeout func() error
 
-	lock sync.Mutex
+	lock            sync.Mutex
+	packetChan      chan packet
+	writePacketChan chan writePacket
 }
 
 type ControlMessage struct {
 	Src     net.IP // source address, specifying only
 	IfIndex int    // interface index, must be 1 <= value when specifying
+}
+
+type packet struct {
+	data []byte
+	addr *net.UDPAddr
+}
+
+type writePacket struct {
+	connection *net.UDPConn
+	data       []byte
+	addr       *net.UDPAddr
 }
 
 type packetConn interface {
@@ -181,14 +194,44 @@ func NewUDPConn(network string, c *net.UDPConn, opts ...UDPOption) *UDPConn {
 		packetConn = newPacketConnIPv4(ipv4.NewPacketConn(c))
 	}
 
+	packetChan := make(chan packet, 1024*1024)
+	go func() {
+		for {
+			buffer := make([]byte, 64*1024)
+			n, s, err := c.ReadFromUDP(buffer)
+			if err != nil {
+				fmt.Printf("cannot read from UDP")
+				return
+			}
+			packetChan <- packet{
+				addr: s,
+				data: buffer[:n],
+			}
+		}
+	}()
+
+	writePacketChan := make(chan writePacket, 1024*1024)
+	go func() {
+		for p := range writePacketChan {
+			p.connection.SetWriteDeadline(time.Time{})
+			_, err := WriteToUDP(p.connection, p.addr, p.data)
+			if err != nil {
+				fmt.Printf("cannot write from UDP")
+				return
+			}
+		}
+	}()
+
 	return &UDPConn{
-		network:        network,
-		connection:     c,
-		heartBeat:      cfg.heartBeat,
-		packetConn:     packetConn,
-		errors:         cfg.errors,
-		onReadTimeout:  cfg.onReadTimeout,
-		onWriteTimeout: cfg.onWriteTimeout,
+		network:         network,
+		connection:      c,
+		heartBeat:       cfg.heartBeat,
+		packetConn:      packetConn,
+		errors:          cfg.errors,
+		onReadTimeout:   cfg.onReadTimeout,
+		onWriteTimeout:  cfg.onWriteTimeout,
+		packetChan:      packetChan,
+		writePacketChan: writePacketChan,
 	}
 }
 
@@ -314,6 +357,19 @@ func (c *UDPConn) WriteWithContext(ctx context.Context, raddr *net.UDPAddr, buff
 		return fmt.Errorf("cannot write with context: invalid raddr")
 	}
 
+	data := make([]byte, len(buffer))
+	copy(data, buffer)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case c.writePacketChan <- writePacket{
+		connection: c.connection,
+		addr:       raddr,
+		data:       data,
+	}:
+		return nil
+	}
+
 	written := 0
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -353,7 +409,9 @@ func (c *UDPConn) ReadWithContext(ctx context.Context, buffer []byte) (int, *net
 		select {
 		case <-ctx.Done():
 			return -1, nil, ctx.Err()
-		default:
+		case data := <-c.packetChan:
+			copy(buffer, data.data)
+			return len(data.data), data.addr, nil
 		}
 		deadline := time.Now().Add(c.heartBeat)
 		err := c.connection.SetReadDeadline(deadline)
